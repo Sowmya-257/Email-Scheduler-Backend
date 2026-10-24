@@ -4,6 +4,7 @@ import { db } from "./db/client";
 import { redisConnection } from "./queue/queue";
 import scheduleRoutes from "./api/schedule.routes";
 import cors from "cors";
+import "./queue/worker";
 
 dotenv.config();
 
