@@ -1,5 +1,6 @@
 import { Worker, DelayedError } from "bullmq";
 import nodemailer from "nodemailer";
+import { Resend } from "resend";
 import dotenv from "dotenv";
 import { redisConnection } from "./queue";
 import { db } from "../db/client";
@@ -7,15 +8,27 @@ import { reserveHourlySlot } from "../rateLimiter/hourlyLimiter";
 
 dotenv.config();
 
+const resend = process.env.RESEND_API_KEY
+  ? new Resend(process.env.RESEND_API_KEY)
+  : null;
+
 const transporter = nodemailer.createTransport({
   host: process.env.SMTP_HOST,
   port: Number(process.env.SMTP_PORT || 587),
   secure: Number(process.env.SMTP_PORT) === 465,
+  connectionTimeout: 10000,
+  greetingTimeout: 10000,
+  socketTimeout: 15000,
   auth: {
     user: process.env.SMTP_USER,
     pass: process.env.SMTP_PASS,
   },
 });
+
+// Restore any stale processing emails from unexpected server shutdowns
+db.execute("UPDATE emails SET status = 'scheduled' WHERE status = 'processing'").catch(
+  () => {}
+);
 
 const worker = new Worker(
   "email-queue",
@@ -62,26 +75,40 @@ const worker = new Worker(
             : email.attachments)
         : [];
 
-      const info = await transporter.sendMail({
-        from: email.sender,
-        to: email.recipient,
-        subject: email.subject,
-        html: email.body,
-        attachments: attachments.map(
-          (file: { filename: string; path: string; mimetype: string }) => ({
-            filename: file.filename,
-            path: file.path,
-            contentType: file.mimetype,
-          })
-        ),
-      });
+      if (resend) {
+        const fromAddress =
+          process.env.RESEND_FROM || "ReachInbox <onboarding@resend.dev>";
+        const { error } = await resend.emails.send({
+          from: fromAddress,
+          to: email.recipient,
+          subject: email.subject,
+          html: email.body,
+        });
+
+        if (error) throw new Error(error.message);
+        console.log("Email delivered via Resend API");
+      } else {
+        const info = await transporter.sendMail({
+          from: email.sender,
+          to: email.recipient,
+          subject: email.subject,
+          html: email.body,
+          attachments: attachments.map(
+            (file: { filename: string; path: string; mimetype: string }) => ({
+              filename: file.filename,
+              path: file.path,
+              contentType: file.mimetype,
+            })
+          ),
+        });
+        console.log("Email sent via SMTP:", info.messageId);
+      }
 
       await db.execute(
         "UPDATE emails SET status = 'sent', sent_at = NOW() WHERE id = ?",
         [emailId]
       );
       await redisConnection.del(`reservation:${emailId}`);
-      console.log("Email sent:", info.messageId);
     } catch (error) {
       const attemptsMade = job.attemptsMade;
       const maxAttempts = Number(job.opts.attempts ?? 5);
