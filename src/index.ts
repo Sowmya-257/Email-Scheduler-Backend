@@ -10,7 +10,15 @@ dotenv.config();
 const app = express();
 app.use(express.json());
 
-app.use(cors({ origin: process.env.FRONTEND_URL || true, credentials: true }));
+const frontendOrigin = process.env.FRONTEND_URL?.replace(/\/+$/, "");
+app.use(
+  cors({
+    origin: frontendOrigin
+      ? [frontendOrigin, `${frontendOrigin}/`, "http://localhost:5173"]
+      : true,
+    credentials: true,
+  })
+);
 
 app.get("/", (_req, res) => {
   res.json({ message: "ReachInbox Email Scheduler Backend API is running", status: "ok" });
