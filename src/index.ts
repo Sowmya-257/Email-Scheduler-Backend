@@ -12,16 +12,40 @@ app.use(express.json());
 
 app.use(cors({ origin: process.env.FRONTEND_URL || true, credentials: true }));
 
+app.get("/", (_req, res) => {
+  res.json({ message: "ReachInbox Email Scheduler Backend API is running", status: "ok" });
+});
 
 app.get("/health", async (_req, res) => {
+  let dbStatus = "unknown";
+  let redisStatus = "unknown";
+  let dbError = null;
+  let redisError = null;
+
   try {
     await db.query("SELECT 1");
-    await redisConnection.ping();
-
-    res.json({ status: "ok", database: "connected", redis: "connected" });
-  } catch {
-    res.status(500).json({ status: "error" });
+    dbStatus = "connected";
+  } catch (err: any) {
+    dbStatus = "disconnected";
+    dbError = err?.message || String(err);
   }
+
+  try {
+    await redisConnection.ping();
+    redisStatus = "connected";
+  } catch (err: any) {
+    redisStatus = "disconnected";
+    redisError = err?.message || String(err);
+  }
+
+  const ok = dbStatus === "connected" && redisStatus === "connected";
+  res.status(ok ? 200 : 500).json({
+    status: ok ? "ok" : "error",
+    database: dbStatus,
+    redis: redisStatus,
+    dbError,
+    redisError,
+  });
 });
 
 const PORT = Number(process.env.PORT || 5000);
