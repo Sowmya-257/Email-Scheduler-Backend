@@ -59,6 +59,9 @@ export async function initDb() {
     if (indexes && indexes.length > 0) {
       await db.query("ALTER TABLE emails DROP INDEX unique_email_schedule");
     }
+
+    // Reset any stale processing jobs from unexpected shutdowns or timeouts
+    await db.query("UPDATE emails SET status = 'scheduled' WHERE status = 'processing'");
   } catch (err: any) {
     console.warn("Database initialization notice:", err?.message || err);
   }
