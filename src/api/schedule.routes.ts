@@ -142,11 +142,23 @@ router.post(
       }
 
       const attachmentData = JSON.stringify(
-        files.map((file) => ({
-          filename: file.originalname,
-          path: path.resolve(file.path),
-          mimetype: file.mimetype,
-        }))
+        await Promise.all(
+          files.map(async (file) => {
+            let base64Data: string | undefined;
+            try {
+              const buffer = await fs.promises.readFile(file.path);
+              base64Data = buffer.toString("base64");
+            } catch (err) {
+              console.warn("Could not read file for base64 persistence:", err);
+            }
+            return {
+              filename: file.originalname,
+              path: path.resolve(file.path),
+              mimetype: file.mimetype,
+              data: base64Data,
+            };
+          })
+        )
       );
 
       const parsedDelay = Math.max(0, Number(delaySeconds) || 0);
@@ -283,30 +295,36 @@ router.get("/:id/attachments/:index", async (req, res) => {
 
     const file = attachments[index];
 
-    if (!file?.path || !file?.mimetype) {
+    if (!file) {
       res.status(404).json({ error: "Attachment not found" });
       return;
     }
 
-    const filePath = path.resolve(file.path);
-    const resolvedUploadDir = path.resolve(uploadDir);
-
-    // Only serve files stored inside the uploads directory.
-    if (!filePath.startsWith(resolvedUploadDir + path.sep)) {
-      res.status(403).json({ error: "Invalid attachment path" });
-      return;
-    }
-
-    if (!fs.existsSync(filePath)) {
-      res.status(404).json({ error: "Attachment file no longer exists" });
-      return;
-    }
-
-    res.setHeader("Content-Type", file.mimetype);
-    res.setHeader("Content-Disposition", "inline");
+    res.setHeader("Content-Type", file.mimetype || "application/octet-stream");
+    res.setHeader(
+      "Content-Disposition",
+      `inline; filename="${encodeURIComponent(file.filename || "attachment")}"`
+    );
     res.setHeader("X-Content-Type-Options", "nosniff");
 
-    res.sendFile(filePath);
+    const filePath = file.path ? path.resolve(file.path) : null;
+    const resolvedUploadDir = path.resolve(uploadDir);
+
+    if (
+      filePath &&
+      filePath.startsWith(resolvedUploadDir + path.sep) &&
+      fs.existsSync(filePath)
+    ) {
+      res.sendFile(filePath);
+      return;
+    }
+
+    if (file.data) {
+      res.send(Buffer.from(file.data, "base64"));
+      return;
+    }
+
+    res.status(404).json({ error: "Attachment file no longer exists" });
   } catch (error) {
     console.error("Attachment preview failed:", error);
     res.status(500).json({ error: "Could not load attachment" });

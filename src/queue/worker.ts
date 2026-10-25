@@ -1,6 +1,7 @@
 import { Worker, DelayedError } from "bullmq";
 import nodemailer from "nodemailer";
 import { Resend } from "resend";
+import fs from "fs";
 import dotenv from "dotenv";
 import { redisConnection } from "./queue";
 import { db } from "../db/client";
@@ -75,33 +76,72 @@ const worker = new Worker(
             : email.attachments)
         : [];
 
+      // Resolve attachments from in-database base64 data or on-disk file
+      const resolvedAttachments = attachments
+        .map((file: any) => {
+          if (file.data) {
+            return {
+              filename: file.filename,
+              content: Buffer.from(file.data, "base64"),
+              contentType: file.mimetype,
+            };
+          }
+          if (file.path && fs.existsSync(file.path)) {
+            return {
+              filename: file.filename,
+              content: fs.readFileSync(file.path),
+              contentType: file.mimetype,
+            };
+          }
+          return null;
+        })
+        .filter(Boolean);
+
       if (resend) {
+        const senderName = email.sender ? email.sender.split("@")[0] : "ReachInbox";
         const fromAddress =
-          process.env.RESEND_FROM || "ReachInbox <onboarding@resend.dev>";
-        const { error } = await resend.emails.send({
+          process.env.RESEND_FROM || `${senderName} via ReachInbox <onboarding@resend.dev>`;
+
+        const resendPayload: any = {
           from: fromAddress,
           to: email.recipient,
           subject: email.subject,
           html: email.body,
-        });
+          reply_to: email.sender,
+        };
 
-        if (error) throw new Error(error.message);
-        console.log("Email delivered via Resend API");
+        if (resolvedAttachments.length > 0) {
+          resendPayload.attachments = resolvedAttachments.map((att: any) => ({
+            filename: att.filename,
+            content: att.content,
+          }));
+        }
+
+        const { error } = await resend.emails.send(resendPayload);
+
+        if (error) {
+          throw new Error(
+            `Resend API error: ${error.message} (Note: Resend free tier onboarding@resend.dev only allows sending to the registered account email)`
+          );
+        }
+        console.log(`Email #${emailId} delivered via Resend API to ${email.recipient}`);
       } else {
         const info = await transporter.sendMail({
           from: email.sender,
           to: email.recipient,
           subject: email.subject,
           html: email.body,
-          attachments: attachments.map(
-            (file: { filename: string; path: string; mimetype: string }) => ({
-              filename: file.filename,
-              path: file.path,
-              contentType: file.mimetype,
-            })
-          ),
+          attachments: resolvedAttachments.length > 0
+            ? resolvedAttachments
+            : attachments.map(
+                (file: { filename: string; path: string; mimetype: string }) => ({
+                  filename: file.filename,
+                  path: file.path,
+                  contentType: file.mimetype,
+                })
+              ),
         });
-        console.log("Email sent via SMTP:", info.messageId);
+        console.log(`Email #${emailId} sent via SMTP:`, info.messageId);
       }
 
       await db.execute(
@@ -109,9 +149,14 @@ const worker = new Worker(
         [emailId]
       );
       await redisConnection.del(`reservation:${emailId}`);
-    } catch (error) {
+    } catch (error: any) {
       const attemptsMade = job.attemptsMade;
       const maxAttempts = Number(job.opts.attempts ?? 5);
+
+      console.error(
+        `Email #${emailId} to ${email?.recipient} failed (attempt ${attemptsMade + 1}/${maxAttempts}):`,
+        error?.message || error
+      );
 
       if (attemptsMade + 1 >= maxAttempts) {
         await redisConnection.del(`reservation:${emailId}`);
