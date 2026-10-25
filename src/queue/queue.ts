@@ -4,8 +4,15 @@ import dotenv from "dotenv";
 
 dotenv.config();
 
-export const redisConnection = process.env.REDIS_URL
-  ? new IORedis(process.env.REDIS_URL, { maxRetriesPerRequest: null })
+// Ensure TLS is enabled if an Upstash Redis URL is provided
+const rawRedisUrl = process.env.REDIS_URL?.trim();
+const redisUrl =
+  rawRedisUrl && rawRedisUrl.includes("upstash.io") && rawRedisUrl.startsWith("redis://")
+    ? rawRedisUrl.replace("redis://", "rediss://")
+    : rawRedisUrl;
+
+export const redisConnection = redisUrl
+  ? new IORedis(redisUrl, { maxRetriesPerRequest: null })
   : new IORedis({
       host: process.env.REDIS_HOST || "localhost",
       port: Number(process.env.REDIS_PORT || 6379),
@@ -13,6 +20,7 @@ export const redisConnection = process.env.REDIS_URL
       maxRetriesPerRequest: null,
     });
 
+// BullMQ delayed queue backed by Redis
 export const emailQueue = new Queue("email-queue", {
   connection: redisConnection,
 });
