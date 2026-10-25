@@ -131,8 +131,9 @@ npm run worker
 | Method | Endpoint | Description |
 | :--- | :--- | :--- |
 | `POST` | `/api/emails/schedule` | Schedule single or bulk emails (JSON or multipart with attachments) |
-| `GET` | `/api/emails/scheduled` | Retrieve all pending / scheduled emails |
-| `GET` | `/api/emails/sent` | Retrieve all sent and failed emails with timestamps |
+| `GET` | `/api/emails/scheduled` | Retrieve all pending / scheduled emails (optional `?sender=...`) |
+| `GET` | `/api/emails/sent` | Retrieve all sent and failed emails with timestamps & Ethereal preview links |
+| `DELETE` | `/api/emails/:id` | Cancel and delete a pending scheduled email |
 | `GET` | `/api/emails/:id` | Retrieve single email details and attachment metadata |
 | `GET` | `/api/emails/:id/attachments/:index` | Download / view email attachment |
 | `GET` | `/health` | Service health check (checks MySQL and Redis connectivity) |

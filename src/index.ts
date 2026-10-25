@@ -1,9 +1,9 @@
 import express from "express";
 import dotenv from "dotenv";
-import { db } from "./db/client";
+import cors from "cors";
+import { db, initDb } from "./db/client";
 import { redisConnection } from "./queue/queue";
 import scheduleRoutes from "./api/schedule.routes";
-import cors from "cors";
 import "./queue/worker";
 
 dotenv.config();
@@ -11,20 +11,23 @@ dotenv.config();
 const app = express();
 app.use(express.json());
 
+// Enable CORS for frontend applications
 const frontendOrigin = process.env.FRONTEND_URL?.replace(/\/+$/, "");
 app.use(
   cors({
     origin: frontendOrigin
-      ? [frontendOrigin, `${frontendOrigin}/`, "http://localhost:5173"]
+      ? [frontendOrigin, `${frontendOrigin}/`, "http://localhost:5173", "http://localhost:3000"]
       : true,
     credentials: true,
   })
 );
 
+// Root informational endpoint
 app.get("/", (_req, res) => {
   res.json({ message: "ReachInbox Email Scheduler Backend API is running", status: "ok" });
 });
 
+// Health check endpoint validating database and Redis connectivity
 app.get("/health", async (_req, res) => {
   let dbStatus = "unknown";
   let redisStatus = "unknown";
@@ -57,10 +60,14 @@ app.get("/health", async (_req, res) => {
   });
 });
 
-const PORT = Number(process.env.PORT || 5000);
-
+// Email scheduling routes
 app.use("/api/emails", scheduleRoutes);
 
-app.listen(PORT, () => {
-  console.log(`Backend running on http://localhost:${PORT}`);
+const PORT = Number(process.env.PORT || 5000);
+
+// Initialize database schema and start Express server
+initDb().finally(() => {
+  app.listen(PORT, () => {
+    console.log(`Backend running on http://localhost:${PORT}`);
+  });
 });

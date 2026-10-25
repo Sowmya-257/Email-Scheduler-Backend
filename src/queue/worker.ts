@@ -1,82 +1,76 @@
 import { Worker, DelayedError } from "bullmq";
 import nodemailer from "nodemailer";
-import { Resend } from "resend";
 import fs from "fs";
 import dotenv from "dotenv";
 import { redisConnection } from "./queue";
 import { db } from "../db/client";
-import { reserveHourlySlot } from "../rateLimiter/hourlyLimiter";
+import { checkRateLimit } from "../rateLimiter/hourlyLimiter";
 
 dotenv.config();
 
-const resend = process.env.RESEND_API_KEY
-  ? new Resend(process.env.RESEND_API_KEY)
-  : null;
-
+// Create Nodemailer transporter configured for Ethereal SMTP
 const transporter = nodemailer.createTransport({
-  host: process.env.SMTP_HOST,
+  host: process.env.SMTP_HOST || "smtp.ethereal.email",
   port: Number(process.env.SMTP_PORT || 587),
-  secure: Number(process.env.SMTP_PORT) === 465,
-  connectionTimeout: 10000,
-  greetingTimeout: 10000,
-  socketTimeout: 15000,
+  secure: false, // 587 uses STARTTLS
   auth: {
     user: process.env.SMTP_USER,
     pass: process.env.SMTP_PASS,
   },
 });
 
-// Restore any stale processing emails from unexpected server shutdowns
-db.execute("UPDATE emails SET status = 'scheduled' WHERE status = 'processing'").catch(
-  () => {}
-);
+// Restore any emails that were in 'processing' status if the server crashed or restarted
+db.execute("UPDATE emails SET status = 'scheduled' WHERE status = 'processing'").catch(() => {});
 
-const worker = new Worker(
+// Background worker processing email queue jobs
+export const emailWorker = new Worker(
   "email-queue",
   async (job, token) => {
-    const { emailId, delaySeconds = 5, hourlyLimit = 10 } = job.data;
+    const { emailId, delaySeconds = 2, hourlyLimit = 100 } = job.data;
 
-    const [rows]: any = await db.execute(
-      "SELECT * FROM emails WHERE id = ?",
-      [emailId]
-    );
-
+    // Fetch the email record from database
+    const [rows]: any = await db.execute("SELECT * FROM emails WHERE id = ?", [emailId]);
     const email = rows[0];
 
-    if (!email || email.status === "sent") return;
+    // Idempotency check: Skip if email does not exist or has already been sent
+    if (!email || email.status === "sent") {
+      return;
+    }
 
-    // Check rate limit and send delay before processing.
-    const { allowed, retryAt } = await reserveHourlySlot(
+    // Rate Limiting: Check minimum delay between emails and hourly quota per sender
+    const { allowed, retryAt } = await checkRateLimit(
       email.sender,
-      Number(emailId),
       Number(delaySeconds),
       Number(hourlyLimit)
     );
 
+    // If rate limit or send delay is active, reschedule the job into the future without failing
     if (!allowed) {
       if (!token) throw new Error("Missing BullMQ job lock token");
 
+      // Update scheduled_at in DB to reflect the new target execution time
       await db.execute(
         "UPDATE emails SET scheduled_at = FROM_UNIXTIME(? / 1000) WHERE id = ?",
         [retryAt, emailId]
       );
+
+      // Move job back to BullMQ delayed set until retryAt
       await job.moveToDelayed(retryAt, token);
       throw new DelayedError();
     }
 
-    await db.execute(
-      "UPDATE emails SET status = 'processing' WHERE id = ?",
-      [emailId]
-    );
+    // Mark email status as processing
+    await db.execute("UPDATE emails SET status = 'processing' WHERE id = ?", [emailId]);
 
     try {
+      // Parse attachments if present
       const attachments = email.attachments
-        ? (typeof email.attachments === "string"
-            ? JSON.parse(email.attachments)
-            : email.attachments)
+        ? typeof email.attachments === "string"
+          ? JSON.parse(email.attachments)
+          : email.attachments
         : [];
 
-      // Resolve attachments from in-database base64 data or on-disk file
+      // Resolve attachments from base64 memory or disk
       const resolvedAttachments = attachments
         .map((file: any) => {
           if (file.data) {
@@ -97,88 +91,42 @@ const worker = new Worker(
         })
         .filter(Boolean);
 
-      if (resend) {
-        const senderName = email.sender ? email.sender.split("@")[0] : "ReachInbox";
-        const fromAddress =
-          process.env.RESEND_FROM || `${senderName} via ReachInbox <onboarding@resend.dev>`;
+      // Send the email via Ethereal SMTP
+      const info = await transporter.sendMail({
+        from: email.sender,
+        to: email.recipient,
+        subject: email.subject,
+        html: email.body,
+        attachments: resolvedAttachments,
+      });
 
-        const resendPayload: any = {
-          from: fromAddress,
-          to: email.recipient,
-          subject: email.subject,
-          html: email.body,
-          reply_to: email.sender,
-        };
+      // Obtain Ethereal test inbox preview URL (accessible in browser)
+      const previewUrl = nodemailer.getTestMessageUrl(info) || null;
 
-        if (resolvedAttachments.length > 0) {
-          resendPayload.attachments = resolvedAttachments.map((att: any) => ({
-            filename: att.filename,
-            content: att.content,
-          }));
-        }
-
-        const { error } = await resend.emails.send(resendPayload);
-
-        if (error) {
-          // If Resend blocks an external recipient due to unverified sandbox domain restrictions,
-          // simulate successful queue processing so bulk testing demonstrates full scheduler functionality.
-          if (
-            error.message.toLowerCase().includes("testing emails to your own email address") ||
-            error.message.toLowerCase().includes("verify your domain")
-          ) {
-            console.warn(
-              `Email #${emailId} to ${email.recipient} processed in Sandbox Mode (recipient outside Resend free tier sandbox). Marked as sent.`
-            );
-          } else {
-            throw new Error(`Resend API error: ${error.message}`);
-          }
-        } else {
-          console.log(`Email #${emailId} delivered via Resend API to ${email.recipient}`);
-        }
-      } else {
-        const info = await transporter.sendMail({
-          from: email.sender,
-          to: email.recipient,
-          subject: email.subject,
-          html: email.body,
-          attachments: resolvedAttachments.length > 0
-            ? resolvedAttachments
-            : attachments.map(
-                (file: { filename: string; path: string; mimetype: string }) => ({
-                  filename: file.filename,
-                  path: file.path,
-                  contentType: file.mimetype,
-                })
-              ),
-        });
-        console.log(`Email #${emailId} sent via SMTP:`, info.messageId);
+      console.log(`[Worker] Email #${emailId} sent to ${email.recipient}. Message ID: ${info.messageId}`);
+      if (previewUrl) {
+        console.log(`[Worker] Ethereal Preview: ${previewUrl}`);
       }
 
+      // Mark email as sent and save Ethereal preview link in database
       await db.execute(
-        "UPDATE emails SET status = 'sent', sent_at = NOW() WHERE id = ?",
-        [emailId]
+        "UPDATE emails SET status = 'sent', sent_at = NOW(), ethereal_url = ? WHERE id = ?",
+        [previewUrl, emailId]
       );
-      await redisConnection.del(`reservation:${emailId}`);
     } catch (error: any) {
       const attemptsMade = job.attemptsMade;
       const maxAttempts = Number(job.opts.attempts ?? 5);
 
       console.error(
-        `Email #${emailId} to ${email?.recipient} failed (attempt ${attemptsMade + 1}/${maxAttempts}):`,
+        `[Worker] Email #${emailId} to ${email?.recipient} failed (Attempt ${attemptsMade + 1}/${maxAttempts}):`,
         error?.message || error
       );
 
+      // If attempts exhausted, mark status as failed; otherwise reset to scheduled for BullMQ retry
       if (attemptsMade + 1 >= maxAttempts) {
-        await redisConnection.del(`reservation:${emailId}`);
-        await db.execute(
-          "UPDATE emails SET status = 'failed' WHERE id = ?",
-          [emailId]
-        );
+        await db.execute("UPDATE emails SET status = 'failed' WHERE id = ?", [emailId]);
       } else {
-        await db.execute(
-          "UPDATE emails SET status = 'scheduled' WHERE id = ?",
-          [emailId]
-        );
+        await db.execute("UPDATE emails SET status = 'scheduled' WHERE id = ?", [emailId]);
       }
 
       throw error;
@@ -190,9 +138,7 @@ const worker = new Worker(
   }
 );
 
-worker.on("ready", () => console.log("Email worker started"));
-worker.on("completed", (job) => console.log(`Job ${job.id} completed`));
-worker.on("failed", (job, err) =>
-  console.error(`Job ${job?.id} failed:`, err.message)
-);
-worker.on("error", (err) => console.error("Worker error:", err.message));
+emailWorker.on("ready", () => console.log("Email worker is ready and listening for jobs"));
+emailWorker.on("completed", (job) => console.log(`Job ${job.id} completed successfully`));
+emailWorker.on("failed", (job, err) => console.error(`Job ${job?.id} failed:`, err.message));
+emailWorker.on("error", (err) => console.error("Worker error:", err.message));

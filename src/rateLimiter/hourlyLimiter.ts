@@ -1,64 +1,66 @@
 import { redisConnection } from "../queue/queue";
 
-export async function reserveHourlySlot(
+// Interface for rate limit check result
+export interface RateLimitResult {
+  allowed: boolean;
+  retryAt: number;
+}
+
+/**
+ * Checks and reserves a sending slot for a sender.
+ * Enforces:
+ * 1. Minimum delay between consecutive emails from the same sender (send throttling)
+ * 2. Maximum emails allowed per hour for that sender (hourly quota)
+ * If limits are reached, computes the next available retry timestamp without dropping jobs.
+ */
+export async function checkRateLimit(
   sender: string,
-  emailId: number,
   delaySeconds: number,
   hourlyLimit: number
-) {
+): Promise<RateLimitResult> {
   const now = Date.now();
   const delayMs = Math.max(0, delaySeconds) * 1000;
+
+  // 1. Check minimum delay between consecutive emails for this sender
+  const lastSentKey = `last-sent:${sender}`;
+  const lastSent = await redisConnection.get(lastSentKey);
+
+  if (lastSent) {
+    const elapsed = now - Number(lastSent);
+    if (elapsed < delayMs) {
+      const waitTime = delayMs - elapsed;
+      return {
+        allowed: false,
+        retryAt: now + waitTime,
+      };
+    }
+  }
+
+  // 2. Check hourly limit using Redis hourly window counter
   const hourWindow = Math.floor(now / 3_600_000);
-
   const hourKey = `rate:${sender}:${hourWindow}`;
-  const delayKey = `send-delay:${sender}`;
-  const reservationKey = `reservation:${emailId}`;
-  const nextHour = (hourWindow + 1) * 3_600_000;
 
-  const result = await redisConnection.eval(
-    `
-    local existing = redis.call('GET', KEYS[3])
-    if existing then
-      return tonumber(existing)
-    end
+  const currentCount = await redisConnection.incr(hourKey);
+  if (currentCount === 1) {
+    // Keep counter for 2 hours to cleanly cover window transitions
+    await redisConnection.expire(hourKey, 7200);
+  }
 
-    local count = tonumber(redis.call('GET', KEYS[1]) or '0')
-    local now = tonumber(ARGV[1])
-    local max = tonumber(ARGV[2])
-    local delay = tonumber(ARGV[3])
-    local nextHour = tonumber(ARGV[4])
-    local nextAllowed = tonumber(redis.call('GET', KEYS[2]) or '0')
+  // If hourly quota exceeded, rollback counter and reschedule for the next hour window
+  if (currentCount > hourlyLimit) {
+    await redisConnection.decr(hourKey);
+    const nextHourMs = (hourWindow + 1) * 3_600_000;
+    return {
+      allowed: false,
+      retryAt: nextHourMs,
+    };
+  }
 
-    if count >= max then
-      local slot = math.max(nextHour, nextAllowed)
-      redis.call('SET', KEYS[2], slot + delay, 'PX', math.max((slot + delay - now) + 60000, 60000))
-      redis.call('SET', KEYS[3], slot, 'EX', 86400)
-      return slot
-    end
-
-    local slot = math.max(now, nextAllowed)
-
-    redis.call('INCR', KEYS[1])
-    redis.call('EXPIRE', KEYS[1], 7200)
-    redis.call('SET', KEYS[2], slot + delay, 'PX', math.max((slot + delay - now) + 60000, 60000))
-    redis.call('SET', KEYS[3], slot, 'EX', 86400)
-
-    return slot
-    `,
-    3,
-    hourKey,
-    delayKey,
-    reservationKey,
-    now,
-    Math.max(1, hourlyLimit),
-    delayMs,
-    nextHour
-  );
-
-  const retryAt = Number(result);
+  // Mark the current send timestamp for consecutive delay throttling
+  await redisConnection.set(lastSentKey, now, "PX", Math.max(delayMs * 2, 10000));
 
   return {
-    allowed: retryAt <= Date.now(),
-    retryAt,
+    allowed: true,
+    retryAt: now,
   };
 }
